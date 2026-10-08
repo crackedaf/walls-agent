@@ -5,10 +5,18 @@
 ## Connect a PC (once)
 
 1. **Phone:** sign in to Walls, then open Widgets › Agents & Tools › Connect a PC › **Get a pairing code**. The code works for ten minutes.
-2. **PC:** in any terminal (PowerShell, Terminal, bash), run:
+2. **PC:** run the line for your system. It downloads the script and starts pairing.
+
+   Windows (PowerShell):
+
+   ```powershell
+   irm https://raw.githubusercontent.com/crackedaf/walls-agent/main/walls-agent.mjs -OutFile $env:TEMP\walls-agent.mjs; node $env:TEMP\walls-agent.mjs pair
+   ```
+
+   macOS and Linux:
 
    ```bash
-   npx -y https://github.com/crackedaf/walls-agent/archive/refs/heads/main.tar.gz pair
+   curl -fsSL https://raw.githubusercontent.com/crackedaf/walls-agent/main/walls-agent.mjs -o /tmp/walls-agent.mjs && node /tmp/walls-agent.mjs pair
    ```
 
    Type the code when it asks. The page on the phone changes to "Connected" within a few seconds.
@@ -59,4 +67,4 @@ In PowerShell, write the path as `$HOME\.walls-agent\walls-agent.mjs`.
 
 ## For Walls developers
 
-The source lives in the Walls repository under `agent/`; this public copy is what `npx` downloads. After changing the script there, run `agent/publish.sh` to update this repository. `WALLS_AGENT_DRY=1` prints reports instead of sending them, and `WALLS_SUPABASE_URL` and `WALLS_SUPABASE_KEY` point it at another server.
+The source lives in the Walls repository under `agent/`; this public copy is what the pairing commands download. After changing the script there, run `agent/publish.sh` to update this repository. `WALLS_AGENT_DRY=1` prints reports instead of sending them, and `WALLS_SUPABASE_URL` and `WALLS_SUPABASE_KEY` point it at another server.

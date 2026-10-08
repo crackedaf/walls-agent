@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // walls-agent: sends what Claude Code is doing, and how much of your plan it has used, to your Walls widgets.
 //
-//   npx -y https://github.com/crackedaf/walls-agent/archive/refs/heads/main.tar.gz pair
+//   Windows (PowerShell):
+//     irm https://raw.githubusercontent.com/crackedaf/walls-agent/main/walls-agent.mjs -OutFile $env:TEMP\walls-agent.mjs; node $env:TEMP\walls-agent.mjs pair
+//   macOS and Linux:
+//     curl -fsSL https://raw.githubusercontent.com/crackedaf/walls-agent/main/walls-agent.mjs -o /tmp/walls-agent.mjs && node /tmp/walls-agent.mjs pair
 //                                      connect this PC (Walls › Widgets › Agents & Tools › Connect a PC shows the code)
 //   node ~/.walls-agent/walls-agent.mjs status   show the connection and the last report
 //   node ~/.walls-agent/walls-agent.mjs unpair   remove the hooks and status line and forget this PC
