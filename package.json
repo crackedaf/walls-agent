@@ -1,7 +1,7 @@
 {
   "name": "walls-agent",
-  "version": "1.0.0",
-  "description": "Sends what Claude Code is doing, and how much of your plan it has used, to the Walls agent widgets.",
+  "version": "2.0.0",
+  "description": "Sends what each Claude Code session is doing, and how much of your plan it has used, to the Walls agent widgets.",
   "type": "module",
   "bin": { "walls-agent": "walls-agent.mjs" },
   "files": ["walls-agent.mjs", "README.md"],

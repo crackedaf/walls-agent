@@ -1,21 +1,26 @@
 #!/usr/bin/env node
-// walls-agent: sends what Claude Code is doing, and how much of your plan it has used, to your Walls widgets.
+// walls-agent: shows what each Claude Code session on this PC is doing, and how much of your plan it has used, on your
+// Walls widgets.
 //
 //   Windows (PowerShell):
 //     irm https://raw.githubusercontent.com/crackedaf/walls-agent/main/walls-agent.mjs -OutFile $env:TEMP\walls-agent.mjs; node $env:TEMP\walls-agent.mjs pair
 //   macOS and Linux:
 //     curl -fsSL https://raw.githubusercontent.com/crackedaf/walls-agent/main/walls-agent.mjs -o /tmp/walls-agent.mjs && node /tmp/walls-agent.mjs pair
 //                                      connect this PC (Walls › Widgets › Agents & Tools › Connect a PC shows the code)
-//   node ~/.walls-agent/walls-agent.mjs status   show the connection and the last report
+//   node ~/.walls-agent/walls-agent.mjs status   show the connection, the open sessions and the last report
+//   node ~/.walls-agent/walls-agent.mjs update   download the newest version and install it
 //   node ~/.walls-agent/walls-agent.mjs unpair   remove the hooks and status line and forget this PC
 //
-// Pairing copies this file to ~/.walls-agent and adds hooks and a status line to ~/.claude/settings.json.
-// Claude Code runs the hooks at each step (in the background, so they never slow it down) and the status line
-// after each reply; the status line is the only place Claude Code shares your 5-hour and weekly limits.
+// Pairing copies this file to ~/.walls-agent and adds hooks and a status line to ~/.claude/settings.json. Claude Code
+// runs the hooks at each step, in the background, and they only note the step in a small file. A watcher process,
+// started by the first hook and gone a few minutes after the last session closes, sends what changed within a second,
+// checks every few seconds that each session's Claude Code is still running, and sends a heartbeat every 30 seconds so
+// the phone can tell a quiet session from a PC that went to sleep. The status line is the only place Claude Code
+// shares your 5-hour and weekly limits.
 //
-// What leaves this PC: the agent's state, short step labels such as "Editing HomeWidgets.kt" or "Running git
-// push", the project folder's name, token counts, plan usage and the session's working time. Never your prompts,
-// code, file contents, full paths or command arguments.
+// What leaves this PC: each session's state, short step labels such as "Editing HomeWidgets.kt" or "Running git
+// push", the project folder's name, token counts, plan usage and working time. Never your prompts, code, file
+// contents, full paths or command arguments.
 //
 // Needs Node 18 or newer. WALLS_AGENT_DRY=1 prints reports instead of sending them.
 
@@ -23,7 +28,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HOME = path.join(os.homedir(), '.walls-agent');
@@ -31,10 +36,13 @@ const CONFIG = path.join(HOME, 'config.json');
 const SESSIONS = path.join(HOME, 'sessions');
 const SEND = path.join(HOME, 'send.json');
 const USAGE = path.join(HOME, 'usage.json');
+const STATUS = path.join(HOME, 'status.json');
+const WATCH = path.join(HOME, 'watch.json');
 const INDEX = path.join(HOME, 'tokens.json');
 const INSTALLED = path.join(HOME, 'walls-agent.mjs');
 const CLAUDE_SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
 const PROJECTS = path.join(os.homedir(), '.claude', 'projects');
+const PUBLIC_SCRIPT = 'https://raw.githubusercontent.com/crackedaf/walls-agent/main/walls-agent.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const DRY = process.env.WALLS_AGENT_DRY === '1';
 
@@ -43,13 +51,28 @@ const DRY = process.env.WALLS_AGENT_DRY === '1';
 const WALLS_URL = 'https://zditldndlgthectqjwzy.supabase.co';
 const WALLS_KEY = 'sb_publishable_4bZEnKY0CMi6USaS5k14xQ_A9wtrAb6';
 
-const STATUS_GAP_MS = 2_000;      // at most one status report every two seconds; the last change always goes
-const USAGE_GAP_MS = 60_000;      // plan usage at most once a minute, sooner when a percentage changes
+const SEND_GAP_MS = 1_000;                 // what changed goes at most once a second; the newest always goes
+const HEARTBEAT_MS = 30_000;               // while a session works or waits, so the phone can tell quiet from gone
+const IDLE_HEARTBEAT_MS = 5 * 60_000;      // while every open session is done or ready
+const RETRY_MS = [2_000, 5_000, 15_000, 60_000];
+const USAGE_GAP_MS = 60_000;               // plan usage at most once a minute, sooner when a percentage changes
+const SWEEP_MS = 3_000;                    // how often the watcher checks that each session's Claude Code still runs
+const WATCH_BEAT_MS = 5_000;
+const WATCH_STALE_MS = 20_000;             // a watcher this quiet has died; the next hook starts another
+const WATCH_LINGER_MS = 3 * 60_000;        // the watcher leaves this long after the last session closed
 const WEEK_SCAN_GAP_MS = 5 * 60_000;
+const QUIET_THINKING_MS = 30 * 60_000;     // "working" with no step running and no word for this long: a lost stop
+const QUIET_STEP_MS = 3 * 3600_000;        // one step running this long with no word: lost too
+const NO_PID_MS = 30 * 60_000;             // a quiet session noted by version 1, which didn't keep Claude Code's process id
+const HEADLESS_IDLE_MS = 60_000;           // a run nobody is at that hasn't started its turn yet
+const AGENT_QUIET_MS = 30 * 60_000;        // a subagent with no step for this long has finished
 const SESSION_KEEP_MS = 3 * 24 * 3600_000;
 const LOG_SIZE = 6;
+const REPORT_SESSIONS = 6;
+const REPORT_MAX_BYTES = 7_000;            // the server takes up to 8,000
 const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure',
-  'PermissionRequest', 'Notification', 'Stop', 'StopFailure', 'SessionEnd'];
+  'PermissionRequest', 'Notification', 'SubagentStart', 'SubagentStop', 'Stop', 'StopFailure', 'SessionEnd'];
+const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest']);
 const NEEDS_YOU = new Set(['permission_prompt', 'agent_needs_input', 'elicitation_dialog', 'elicitation_url_dialog']);
 
 // Files
@@ -90,6 +113,36 @@ async function readStdin() {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch { return {}; }
 }
 
+// Processes
+
+/** Whether process [pid] runs. Works on Windows too: signal 0 only checks. */
+export function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+/** When process [pid] started, on Linux, so a reused id isn't taken for the same Claude Code; null elsewhere. */
+function processStart(pid) {
+  if (process.platform !== 'linux' || !pid) return null;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] || null;
+  } catch { return null; }
+}
+
+/**
+ * The Claude Code a hook or the status line runs for: Claude Code puts its process id, whether a person is at it
+ * (0 for `claude -p`, scripts and background sessions) and the folder it started in in their environment.
+ */
+export function claudeProcess(env = process.env) {
+  const pid = Number.parseInt(env.CLAUDE_PID ?? '', 10);
+  return {
+    pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+    attended: env.CLAUDE_CODE_SESSION_ATTENDED === '0' ? false : env.CLAUDE_CODE_SESSION_ATTENDED === '1' ? true : null,
+    projectDir: env.CLAUDE_PROJECT_DIR || null,
+  };
+}
+
 // What a step looks like on the widget
 
 const base = (p) => (typeof p === 'string' && p ? path.basename(p) : '');
@@ -119,28 +172,43 @@ export function describe(tool, input = {}) {
     case 'Write': return file ? [`Writing ${file}`, `write ${file}`] : ['Writing a file', 'write'];
     case 'Read': return file ? [`Reading ${file}`, `read ${file}`] : ['Reading a file', 'read'];
     case 'Bash': case 'PowerShell': { const c = commandName(input.command); return [`Running ${c}`, c]; }
+    case 'BashOutput': case 'TaskOutput': return ['Checking on a task', 'check a task'];
+    case 'KillShell': case 'TaskStop': return ['Stopping a task', 'stop a task'];
     case 'Grep': {
       const p = String(input.pattern || '');
       return /^[\w.-]{1,24}$/.test(p) ? [`Searching for ${p}`, `grep ${p}`] : ['Searching the code', 'grep'];
     }
     case 'Glob': return ['Finding files', 'glob'];
+    case 'LSP': return ['Checking the code', 'lsp'];
     case 'WebFetch': { let h = ''; try { h = new URL(input.url).hostname; } catch {} return h ? [`Reading ${h}`, `fetch ${h}`] : ['Reading a web page', 'fetch']; }
     case 'WebSearch': return ['Searching the web', 'web search'];
     case 'Task': case 'Agent': return ['Running a subagent', 'subagent'];
-    case 'TodoWrite': return ['Planning', 'plan'];
+    case 'SendMessage': return ['Messaging an agent', 'message an agent'];
+    case 'TodoWrite': case 'TaskCreate': case 'TaskUpdate': case 'TaskList': case 'TaskGet': case 'EnterPlanMode': return ['Planning', 'plan'];
+    case 'ExitPlanMode': return ['Presenting a plan', 'plan ready'];
+    case 'AskUserQuestion': return ['Asking you something', 'question'];
     case 'Skill': return ['Using a skill', 'skill'];
+    case 'ToolSearch': return ['Loading tools', 'load tools'];
+    case 'StructuredOutput': return ['Returning a result', 'result'];
+    case 'Monitor': return ['Watching a task', 'watch'];
+    case 'ScheduleWakeup': case 'CronCreate': return ['Scheduling a check-in', 'schedule'];
     default: {
       const m = /^mcp__(.+?)__/.exec(tool || '');
-      const name = m ? m[1].replace(/^claude_ai_/, '').replace(/_/g, ' ') : String(tool || 'a tool');
+      const name = m ? m[1].replace(/^claude_ai_/, '').replace(/^plugin_[^_]+_/, '').replace(/_/g, ' ')
+        : String(tool || 'a tool').replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase();
       return [`Using ${clip(name, 24)}`, clip(name.toLowerCase(), 24)];
     }
   }
 }
 
-// Session state
+// Sessions
 
 export function blankSession(id, at) {
-  return { id, project: '', state: 'idle', label: 'Ready', at, last: 0, workedMs: 0, workingSince: null, steps: 0, log: [], transcript: '' };
+  return {
+    id, pid: null, pidStart: null, attended: null, project: '', state: 'idle', label: 'Ready', started: at, at, last: 0,
+    workedMs: 0, workingSince: null, steps: 0, log: [], transcript: '', pending: [], agents: {}, background: 0,
+    ctx: null, model: null,
+  };
 }
 
 function stopClock(s, at) {
@@ -152,32 +220,65 @@ function startClock(s, at) {
   if (s.workingSince == null) s.workingSince = at;
 }
 
-/** Folds one hook event, which happened at [at], into a session. Late events never undo newer ones. */
-export function apply(s, e, at) {
-  if (e.cwd) s.project = base(e.cwd);
+function finish(s, at, label = 'Finished') {
+  s.state = 'done'; s.label = label; s.background = 0; s.pending = []; stopClock(s, at);
+}
+
+/** Agents still working after the main thread stopped, from Stop's and SubagentStop's list of background work. */
+export function backgroundAgents(tasks) {
+  return (Array.isArray(tasks) ? tasks : []).filter((t) => /agent|workflow/i.test(String(t?.type ?? ''))
+    && !/complete|done|finish|fail|error|kill|cancel|stop/i.test(String(t?.status ?? ''))).length;
+}
+
+const backgroundLabel = (n) => (n === 1 ? 'Background agent' : `${n} background agents`);
+
+/**
+ * Folds one hook event, which happened at [at], into a session. [proc] is the Claude Code it came from. Late events
+ * (hooks run side by side) never undo newer ones. A subagent's steps show while the session works, but never wake a
+ * session that has finished: Claude Code runs its own small agents after a reply, and they used to leave the
+ * widget stuck on "working".
+ */
+export function apply(s, e, at, proc = {}) {
+  if (proc.pid && proc.pid !== s.pid) { s.pid = proc.pid; s.pidStart = proc.pidStart ?? null; }
+  if (proc.attended != null) s.attended = proc.attended;
+  // The project is the folder the session started in: `cd` in a command moves the hook's cwd, not the project.
+  if (proc.projectDir) s.project = base(proc.projectDir);
+  else if (e.cwd && !e.agent_id && !s.project) s.project = base(e.cwd);
   if (e.transcript_path) s.transcript = e.transcript_path;
+  const event = e.hook_event_name;
+  const toolId = typeof e.tool_use_id === 'string' ? e.tool_use_id : null;
   if (at < s.last) {
-    // An earlier event finishing late (hooks run side by side): count its step, change nothing else.
-    if (e.hook_event_name === 'PreToolUse') s.steps++;
+    // An earlier event finishing late: count its step, change nothing else.
+    if (event === 'PreToolUse') s.steps++;
+    if (toolId && event !== 'PreToolUse') s.pending = s.pending.filter((t) => t !== toolId);
     return s;
   }
+  if (e.agent_id || event === 'SubagentStart' || event === 'SubagentStop') return subagent(s, e, at, toolId);
   s.last = at;
   s.at = at;
-  switch (e.hook_event_name) {
+  switch (event) {
     case 'SessionStart':
-      if (e.source === 'startup' || e.source === 'clear') Object.assign(s, blankSession(s.id, at), { project: s.project, transcript: s.transcript, last: at });
-      else { s.state = 'idle'; s.label = 'Ready'; }
+      if (e.source === 'startup' || e.source === 'clear') {
+        Object.assign(s, blankSession(s.id, at), { pid: s.pid, pidStart: s.pidStart, attended: s.attended, project: s.project, transcript: s.transcript, last: at });
+      } else if (e.source === 'resume' || e.source === 'fork') {
+        s.state = 'idle'; s.label = 'Ready'; s.pending = []; stopClock(s, at);
+      }
+      // "compact" happens in the middle of a turn: nothing changes.
       break;
     case 'UserPromptSubmit':
-      s.state = 'working'; s.label = 'Thinking'; startClock(s, at);
+      s.state = 'working'; s.label = 'Thinking'; s.background = 0; s.pending = []; startClock(s, at);
       break;
     case 'PreToolUse': {
       const [label, line] = describe(e.tool_name, e.tool_input);
-      s.state = 'working'; s.label = label; s.steps++; startClock(s, at);
+      s.steps++;
       s.log = [...s.log, line].slice(-LOG_SIZE);
+      if (toolId) s.pending = [...s.pending.filter((t) => t !== toolId), toolId].slice(-20);
+      if (e.tool_name === 'AskUserQuestion') { s.state = 'waiting'; s.label = label; stopClock(s, at); break; }
+      s.state = 'working'; s.label = label; startClock(s, at);
       break;
     }
     case 'PostToolUse': case 'PostToolUseFailure':
+      if (toolId) s.pending = s.pending.filter((t) => t !== toolId);
       if (s.state === 'waiting') { s.state = 'working'; startClock(s, at); }
       break;
     case 'PermissionRequest': {
@@ -186,55 +287,186 @@ export function apply(s, e, at) {
       break;
     }
     case 'Notification':
-      if (NEEDS_YOU.has(e.notification_type)) {
+      if (NEEDS_YOU.has(e.notification_type) && s.state !== 'done' && s.state !== 'idle') {
         s.state = 'waiting';
         if (!s.label.startsWith('Approve')) s.label = e.notification_type === 'permission_prompt' ? 'Approve a command' : 'Asking you something';
         stopClock(s, at);
       }
       break;
-    case 'Stop':
-      s.state = 'done'; s.label = 'Finished'; stopClock(s, at);
+    case 'Stop': {
+      const n = backgroundAgents(e.background_tasks);
+      if (n > 0) { s.state = 'working'; s.label = backgroundLabel(n); s.background = n; s.pending = []; startClock(s, at); }
+      else finish(s, at);
       break;
+    }
     case 'StopFailure':
-      s.state = 'done'; s.label = 'Stopped with an error'; stopClock(s, at);
+      finish(s, at, 'Stopped with an error');
       break;
     case 'SessionEnd':
-      s.state = 'ended'; s.label = 'Closed'; stopClock(s, at);
+      s.state = 'ended'; s.label = 'Closed'; s.pending = []; stopClock(s, at);
       break;
   }
   return s;
 }
 
-const RANK = { waiting: 4, working: 3, done: 2, idle: 1, ended: 0 };
-
-/** The session the widget shows: one waiting for you, else working, else the latest; plus how many are open. */
-export function pick(sessions) {
-  const open = sessions.filter((s) => s.state !== 'ended');
-  const pool = open.length ? open : sessions;
-  return [pool.slice().sort((a, b) => (RANK[b.state] - RANK[a.state]) || (b.at - a.at))[0], open.length];
+function subagent(s, e, at, toolId) {
+  const id = String(e.agent_id || '');
+  const event = e.hook_event_name;
+  if (event === 'SubagentStop') {
+    delete s.agents[id];
+    if (s.background > 0 && s.state === 'working') {
+      const n = Array.isArray(e.background_tasks) ? backgroundAgents(e.background_tasks) : s.background - 1;
+      s.last = at; s.at = at;
+      if (n > 0) { s.background = n; s.label = backgroundLabel(n); } else finish(s, at);
+    }
+    return s;
+  }
+  // Only agents that started while the session worked count; ones after a reply are Claude Code's own.
+  if (s.state !== 'working' && s.state !== 'waiting') return s;
+  if (id) s.agents[id] = at;
+  if (event === 'PreToolUse') {
+    const [label, line] = describe(e.tool_name, e.tool_input);
+    s.steps++;
+    s.log = [...s.log, line].slice(-LOG_SIZE);
+    if (toolId) s.pending = [...s.pending.filter((t) => t !== toolId), toolId].slice(-20);
+    if (s.state === 'working') s.label = label;
+    s.last = at; s.at = at;
+  } else if (event === 'PostToolUse' || event === 'PostToolUseFailure') {
+    if (toolId) s.pending = s.pending.filter((t) => t !== toolId);
+    if (s.state === 'waiting') { s.state = 'working'; startClock(s, at); }
+  } else if (event === 'PermissionRequest') {
+    const [label] = describe(e.tool_name, e.tool_input);
+    s.state = 'waiting'; s.label = `Approve: ${label.replace(/^\w+ /, (w) => w.toLowerCase())}`; stopClock(s, at);
+    s.last = at; s.at = at;
+  }
+  return s;
 }
 
-export function statusReport(s, open, tokens, model, now) {
-  if (!s) return { v: 1, state: 'offline', label: 'No session yet', project: '', steps: 0, worked_ms: 0, working: false, log: [], open: 0, at: now };
-  const worked = s.workedMs + (s.workingSince != null ? Math.max(0, now - s.workingSince) : 0);
+/** Subagents that took a step in the last half hour and haven't stopped. */
+export function runningAgents(s, now) {
+  return Object.values(s.agents || {}).filter((t) => now - t < AGENT_QUIET_MS).length;
+}
+
+/**
+ * Settles what hooks can't say: a session whose Claude Code has exited (killed, closed with its window, or a
+ * `claude -p` run that ends before its last hooks run) is closed; so is the older session of a Claude Code that
+ * started another (`/clear`). A run with nobody at it (`claude -p`, scripts, background sessions) leaves as soon as
+ * it stops. Returns the sessions it changed. [prevSweep] is the last check, which bounds when a process died.
+ */
+export function sweep(sessions, now, prevSweep = 0, isAlive = alive, startOf = processStart) {
+  const changed = new Set();
+  const end = (s, at) => {
+    s.state = 'ended'; s.label = 'Closed'; s.pending = []; s.background = 0;
+    stopClock(s, at); s.at = Math.max(s.at, at); changed.add(s);
+  };
+  const open = sessions.filter((s) => s.state !== 'ended');
+  const newest = new Map();
+  for (const s of open) {
+    if (s.pid && (!newest.has(s.pid) || newest.get(s.pid).last < s.last)) newest.set(s.pid, s);
+  }
+  for (const s of open) {
+    const diedBy = Math.max(s.last, Math.min(now, prevSweep ? prevSweep + SWEEP_MS : s.last));
+    if (s.pid) {
+      if (!isAlive(s.pid)) { end(s, diedBy); continue; }
+      const started = startOf(s.pid);
+      if (s.pidStart && started && started !== s.pidStart) { end(s, diedBy); continue; }
+      if (newest.get(s.pid) !== s) { end(s, s.last); continue; }
+    } else if (now - s.at > NO_PID_MS) { end(s, s.at); continue; }
+    if (s.attended === false && (s.state === 'done' || (s.state === 'idle' && now - s.at > HEADLESS_IDLE_MS))) { end(s, s.at); continue; }
+    if (s.state === 'working') {
+      const quiet = now - s.at;
+      if ((s.pending.length === 0 && s.background === 0 && quiet > QUIET_THINKING_MS) || quiet > QUIET_STEP_MS) {
+        finish(s, s.at); changed.add(s);
+      }
+    }
+  }
+  return [...changed];
+}
+
+const RANK = { waiting: 4, working: 3, done: 2, idle: 1, ended: 0 };
+
+/** Needs you first, then working, then the rest; the most recent first within each. */
+export function ranked(sessions) {
+  return sessions.slice().sort((a, b) => (RANK[b.state] - RANK[a.state]) || (b.at - a.at));
+}
+
+function worked(s, now) {
+  return s.workedMs + (s.workingSince != null ? Math.max(0, now - s.workingSince) : 0);
+}
+
+function sessionReport(s, now, tokens) {
   return {
-    v: 1,
-    state: s.state === 'ended' ? 'offline' : s.state,
-    label: clip(s.label, 48),
-    project: clip(s.project, 32),
+    id: String(s.id).slice(0, 8),
+    project: clip(s.project || '', 32),
+    state: s.state,
+    label: clip(s.label || '', 48),
     steps: s.steps,
-    worked_ms: worked,
-    working: s.state === 'working',
+    worked_ms: worked(s, now),
+    idle_ms: Math.max(0, now - s.at),
+    age_ms: Math.max(0, now - (s.started || s.at)),
     log: s.log.slice(-4).map((l) => clip(l, 32)),
     tokens: tokens ?? null,
-    model: model ?? null,
-    open,
+    model: s.model ?? null,
+    ctx: s.ctx ?? null,
+    agents: runningAgents(s, now),
+    ...(s.attended === false ? { headless: true } : {}),
+  };
+}
+
+/**
+ * The report the phone gets: every open session (the six most pressing), how many are open, and, when none is, the
+ * last one that closed. The first session also fills the fields an older Walls reads.
+ */
+export function statusReport(sessions, now, tokensOf = () => null) {
+  const open = ranked(sessions.filter((s) => s.state !== 'ended'));
+  const items = open.slice(0, REPORT_SESSIONS).map((s) => sessionReport(s, now, tokensOf(s)));
+  const closed = open.length ? null : sessions.filter((s) => s.state === 'ended' && s.attended !== false).sort((a, b) => b.at - a.at)[0];
+  const last = closed ? { ...sessionReport(closed, now, tokensOf(closed)), state: 'ended' } : null;
+  const first = items[0] ?? last;
+  const report = {
+    v: 2,
+    open: open.length,
+    sessions: items,
+    last,
+    // The next heartbeat comes within this, so the phone knows when a quiet PC has gone.
+    beat_ms: items.some((x) => x.state === 'working' || x.state === 'waiting') ? HEARTBEAT_MS : IDLE_HEARTBEAT_MS,
+    // For older versions of Walls, which read one session.
+    state: !first || first.state === 'ended' ? 'offline' : first.state,
+    label: first ? first.label : 'No session yet',
+    project: first?.project ?? '',
+    steps: first?.steps ?? 0,
+    worked_ms: first?.worked_ms ?? 0,
+    working: first?.state === 'working',
+    log: first?.log ?? [],
+    tokens: first?.tokens ?? null,
+    model: first?.model ?? null,
     at: now,
   };
+  // Keep under the server's size limit: fewer log lines, then fewer sessions.
+  while (Buffer.byteLength(JSON.stringify(report)) > REPORT_MAX_BYTES) {
+    const longest = report.sessions.find((x) => x.log.length > 1);
+    if (longest) longest.log = longest.log.slice(-1);
+    else if (report.sessions.length > 1) report.sessions.pop();
+    else break;
+  }
+  return report;
+}
+
+/** What makes a report worth sending now: everything but the clocks, which the phone moves on itself. */
+export function reportKey(report) {
+  const strip = (x) => x && { ...x, worked_ms: undefined, idle_ms: undefined, age_ms: undefined };
+  return JSON.stringify({ open: report.open, beat: report.beat_ms, sessions: report.sessions.map(strip), last: report.last?.id ?? null });
 }
 
 function sessionFile(id) {
   return path.join(SESSIONS, `${String(id).replace(/[^\w-]/g, '').slice(0, 80) || 'unknown'}.json`);
+}
+
+function readSession(file) {
+  const s = readJson(file, null);
+  if (!s || typeof s !== 'object' || !s.id) return null;
+  // Sessions noted by version 1 lack the newer fields.
+  return { ...blankSession(s.id, s.at || 0), ...s, pending: s.pending || [], agents: s.agents || {}, background: s.background || 0 };
 }
 
 function allSessions(now) {
@@ -244,7 +476,7 @@ function allSessions(now) {
   for (const n of names) {
     if (!n.endsWith('.json')) continue;
     const file = path.join(SESSIONS, n);
-    const s = readJson(file, null);
+    const s = readSession(file);
     if (!s) continue;
     if (now - s.at > SESSION_KEEP_MS) { try { fs.unlinkSync(file); } catch {} continue; }
     out.push(s);
@@ -340,17 +572,6 @@ async function weekTokens(now, force) {
   });
 }
 
-async function sessionTokens(transcript) {
-  if (!transcript) return null;
-  return locked('tokens', async () => {
-    const index = readJson(INDEX, { files: {} });
-    const e = scanTranscript(transcript, index.files[transcript]);
-    index.files[transcript] = e;
-    writeJson(INDEX, index);
-    return e.total;
-  });
-}
-
 // Sending
 
 function config() {
@@ -371,60 +592,125 @@ async function rpc(cfg, fn, body) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
+async function report(cfg, status, usage) {
+  const res = await rpc(cfg, 'agent_report', { p_token: cfg.token, p_agent: 'claude_code', p_status: status, p_usage: usage })
+    .catch((e) => ({ ok: false, text: String(e?.message || e) }));
+  if (!res.ok && /not connected to Walls/.test(res.text || '')) writeJson(CONFIG, { ...cfg, revoked: true }, 0o600);
+  return res.ok;
+}
+
+// The watcher
+
+/** Starts the watcher unless one is running; hooks and the status line call this, so it is cheap when one is. */
+export function ensureWatcher() {
+  const w = readJson(WATCH, null);
+  if (w && alive(w.pid) && Date.now() - (w.beat || 0) < WATCH_STALE_MS) return false;
+  // Two hooks at once may both get here; the watcher that loses the claim in watch.json leaves at once.
+  const script = fs.existsSync(INSTALLED) ? INSTALLED : SELF;
+  const child = spawn(process.execPath, [script, 'watch'], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.unref();
+  writeJson(WATCH, { pid: child.pid, beat: Date.now(), started: Date.now() });
+  return true;
+}
+
+function scriptStamp() {
+  try { return fs.statSync(SELF).mtimeMs; } catch { return 0; }
+}
+
 /**
- * Sends the newest status and/or usage, at most once per gap. A process that finds a report sent a moment ago waits
- * out the gap and sends whatever is newest then, unless a later process already has.
+ * Sends each change within a second, a heartbeat every 30 seconds while a session is open, and plan usage when it
+ * changes; closes sessions whose Claude Code has gone; leaves a few minutes after the last one closed, or when a newer
+ * version of this file is installed (the next hook starts it).
  */
-async function flush(kind) {
-  const cfg = config();
-  if (!cfg?.token || cfg.revoked) return;
-  const gap = kind === 'usage' ? USAGE_GAP_MS : STATUS_GAP_MS;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const wait = await locked('send', async () => {
-      const sent = readJson(SEND, {});
-      const mark = readJson(kind === 'usage' ? USAGE : path.join(HOME, 'status.json'), null);
-      if (!mark || mark.seq === sent[`${kind}Seq`]) return 0;
-      const since = Date.now() - (sent[`${kind}At`] || 0);
-      const urgent = kind === 'usage' && mark.urgent && mark.seq !== sent.usageSeq;
-      if (since < gap && !urgent) return gap - since;
-      const res = await rpc(cfg, 'agent_report', {
-        p_token: cfg.token, p_agent: 'claude_code',
-        p_status: kind === 'status' ? mark.report : null,
-        p_usage: kind === 'usage' ? mark.report : null,
-      }).catch((e) => ({ ok: false, text: String(e) }));
-      if (res.ok) writeJson(SEND, { ...readJson(SEND, {}), [`${kind}Seq`]: mark.seq, [`${kind}At`]: Date.now() });
-      else if (/not connected to Walls/.test(res.text || '')) writeJson(CONFIG, { ...cfg, revoked: true }, 0o600);
-      return 0;
-    });
-    if (!wait) return;
-    await sleep(Math.min(wait, gap));
+async function watch() {
+  const me = process.pid;
+  const claim = () => writeJson(WATCH, { pid: me, beat: Date.now(), started });
+  const started = Date.now();
+  const stamp = scriptStamp();
+  // Two hooks can start a watcher at the same moment; the one watch.json doesn't name leaves.
+  const owner = readJson(WATCH, null);
+  if (owner && owner.pid !== me && alive(owner.pid) && Date.now() - (owner.beat || 0) < WATCH_STALE_MS) return;
+  claim();
+  const stop = () => { const w = readJson(WATCH, null); if (w?.pid === me) try { fs.unlinkSync(WATCH); } catch {} process.exit(0); };
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
+
+  const tokens = new Map(); // transcript → its running count, read as it grows
+  const tokensOf = (s) => {
+    if (!s.transcript) return null;
+    const e = scanTranscript(s.transcript, tokens.get(s.transcript));
+    tokens.set(s.transcript, e);
+    return e.total;
+  };
+  let prevSweep = 0, lastBeat = 0, lastSent = 0, lastKey = null, failures = 0, nextTry = 0;
+  let lastUsageSeq = readJson(SEND, {}).usageSeq ?? null, lastUsageAt = 0, lastOpen = Date.now(), finalSent = false;
+
+  for (;;) {
+    const now = Date.now();
+    const w = readJson(WATCH, null);
+    if (w && w.pid !== me && alive(w.pid)) return; // another watcher took over
+    const cfg = config();
+    if (!cfg?.token || cfg.revoked || scriptStamp() !== stamp) return stop();
+    if (now - lastBeat >= WATCH_BEAT_MS) { claim(); lastBeat = now; }
+
+    // Close sessions whose Claude Code is gone.
+    let sessions = allSessions(now);
+    if (now - prevSweep >= SWEEP_MS) {
+      // A look without the lock first; only a change takes it, re-reading what hooks may have written since.
+      if (sweep(sessions.map((s) => ({ ...s })), now, prevSweep).length) {
+        await locked('state', async () => {
+          for (const s of sweep(allSessions(now), now, prevSweep)) writeJson(sessionFile(s.id), s);
+        });
+        sessions = allSessions(now);
+      }
+      prevSweep = now;
+    }
+
+    const status = statusReport(sessions, now, tokensOf);
+    const key = reportKey(status);
+    if (status.open > 0) { lastOpen = now; finalSent = false; }
+    const due = key !== lastKey ? now - lastSent >= SEND_GAP_MS : (status.open > 0 && now - lastSent >= status.beat_ms);
+    if (due && now >= nextTry) {
+      if (await report(cfg, status, null)) {
+        lastSent = now; lastKey = key; failures = 0;
+        writeJson(STATUS, { report: status, sentAt: now });
+        if (status.open === 0) finalSent = true;
+      } else {
+        nextTry = now + RETRY_MS[Math.min(failures++, RETRY_MS.length - 1)];
+        if (config()?.revoked) return stop();
+      }
+    }
+
+    // Plan usage, from the status line.
+    const mark = readJson(USAGE, null);
+    if (mark && mark.seq !== lastUsageSeq && (mark.urgent || now - lastUsageAt >= USAGE_GAP_MS) && now >= nextTry) {
+      const usage = { ...mark.report, week: await weekTokens(now, false).catch(() => mark.report.week ?? []) };
+      if (await report(cfg, null, usage)) {
+        lastUsageSeq = mark.seq; lastUsageAt = now;
+        writeJson(SEND, { ...readJson(SEND, {}), usageSeq: mark.seq, usageAt: now });
+      } else nextTry = now + RETRY_MS[Math.min(failures++, RETRY_MS.length - 1)];
+    }
+
+    if (status.open === 0 && finalSent && now - lastOpen > WATCH_LINGER_MS) return stop();
+    await sleep(SEND_GAP_MS);
   }
 }
 
-async function publishStatus(now) {
-  await locked('state', async () => {
-    const sessions = allSessions(now);
-    const [s, open] = pick(sessions);
-    const tokens = s?.transcript ? await sessionTokens(s.transcript) : null;
-    const model = readJson(USAGE, null)?.model ?? null;
-    const prev = readJson(path.join(HOME, 'status.json'), { seq: 0 });
-    writeJson(path.join(HOME, 'status.json'), { seq: prev.seq + 1, report: statusReport(s, open, tokens, model, now) });
-  });
-  await flush('status');
-}
-
-// Commands
+// Hooks and the status line
 
 async function hook() {
   const e = await readStdin();
   const at = Date.now();
-  if (!e.session_id || !config()?.token) return;
+  const cfg = config();
+  if (!e.session_id || !cfg?.token || cfg.revoked) return;
+  const proc = claudeProcess();
+  if (proc.pid) proc.pidStart = processStart(proc.pid);
   await locked('state', async () => {
     const file = sessionFile(e.session_id);
-    const s = readJson(file, null) || blankSession(e.session_id, at);
-    writeJson(file, apply(s, e, at));
+    const s = readSession(file) || blankSession(e.session_id, at);
+    writeJson(file, apply(s, e, at, proc));
   });
-  await publishStatus(Date.now());
+  ensureWatcher();
 }
 
 const pct = (v) => (typeof v === 'number' && isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : null);
@@ -443,21 +729,36 @@ export function usageReport(input, week, now) {
   };
 }
 
-/** Claude Code's status line: saves the plan usage, sends it in the background, and prints a short line. */
+/** Claude Code's status line: notes the plan usage and this session's context, and prints a short line. */
 async function statusline() {
   const input = await readStdin();
   const cfg = config();
   const now = Date.now();
   const prev = readJson(USAGE, null);
-  const report = usageReport(input, prev?.report?.week ?? [], now);
-  const changed = !prev || prev.report.five_hour?.pct !== report.five_hour?.pct || prev.report.seven_day?.pct !== report.seven_day?.pct;
+  const usage = usageReport(input, prev?.report?.week ?? [], now);
   if (cfg?.token && !cfg.revoked) {
+    const changed = !prev || prev.report.five_hour?.pct !== usage.five_hour?.pct || prev.report.seven_day?.pct !== usage.seven_day?.pct;
     await locked('usage', async () => {
       const latest = readJson(USAGE, prev);
-      report.week = latest?.report?.week ?? report.week;
-      writeJson(USAGE, { seq: (latest?.seq || 0) + 1, urgent: changed, model: input.model?.display_name ?? null, report });
+      usage.week = latest?.report?.week ?? usage.week;
+      writeJson(USAGE, { seq: (latest?.seq || 0) + 1, urgent: changed, model: input.model?.display_name ?? null, report: usage });
     });
-    spawn(process.execPath, [SELF, 'send-usage'], { detached: true, stdio: 'ignore' }).unref();
+    const id = input.session_id || process.env.CLAUDE_CODE_SESSION_ID;
+    if (id) {
+      const proc = claudeProcess();
+      await locked('state', async () => {
+        const file = sessionFile(id);
+        const s = readSession(file) || blankSession(id, now);
+        s.ctx = pct(input.context_window?.used_percentage);
+        s.model = typeof input.model?.display_name === 'string' ? clip(input.model.display_name, 24) : s.model;
+        const root = proc.projectDir || input.workspace?.project_dir;
+        if (root) s.project = base(root); else if (!s.project) s.project = base(input.workspace?.current_dir || input.cwd);
+        if (proc.pid && !s.pid) { s.pid = proc.pid; s.pidStart = processStart(proc.pid); }
+        if (proc.attended != null && s.attended == null) s.attended = proc.attended;
+        writeJson(file, s);
+      });
+    }
+    ensureWatcher();
   }
   const own = cfg?.previousStatusLine;
   if (own?.command) {
@@ -468,25 +769,14 @@ async function statusline() {
     return;
   }
   const bits = [];
-  if (report.five_hour) bits.push(`5h ${report.five_hour.pct}%`);
-  if (report.seven_day) bits.push(`week ${report.seven_day.pct}%`);
-  if (report.context_pct != null) bits.push(`context ${report.context_pct}%`);
+  if (usage.five_hour) bits.push(`5h ${usage.five_hour.pct}%`);
+  if (usage.seven_day) bits.push(`week ${usage.seven_day.pct}%`);
+  if (usage.context_pct != null) bits.push(`context ${usage.context_pct}%`);
   const note = !cfg?.token ? 'not connected' : cfg.revoked ? 'removed in the app · run pair again' : '';
   process.stdout.write(`walls · ${[...bits, note].filter(Boolean).join(' · ')}\n`);
 }
 
-async function sendUsage() {
-  const now = Date.now();
-  await locked('usage', async () => {
-    const mark = readJson(USAGE, null);
-    if (!mark) return;
-    mark.report.week = await weekTokens(now, false);
-    writeJson(USAGE, mark);
-  });
-  await flush('usage');
-  // The status carries the session's token total; refresh it while we are here.
-  await publishStatus(Date.now());
-}
+// Setup
 
 function ourCommand(h) {
   const text = [h?.command, ...(h?.args || [])].join(' ');
@@ -502,8 +792,9 @@ function install() {
   const hooks = settings.hooks || {};
   for (const event of HOOK_EVENTS) {
     const groups = (hooks[event] || []).map((g) => ({ ...g, hooks: (g.hooks || []).filter((h) => !ourCommand(h)) })).filter((g) => g.hooks.length);
+    // Exec form: no shell, so paths with spaces or quotes are safe, and the hook is Claude Code's own child.
     const ours = { type: 'command', command: process.execPath, args: [INSTALLED, 'hook'], async: true, timeout: 30 };
-    groups.push(['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest'].includes(event) ? { matcher: '*', hooks: [ours] } : { hooks: [ours] });
+    groups.push(TOOL_EVENTS.has(event) ? { matcher: '*', hooks: [ours] } : { hooks: [ours] });
     hooks[event] = groups;
   }
   settings.hooks = hooks;
@@ -523,7 +814,14 @@ export function statusLineCommand(platform = process.platform, node = process.ex
   return platform === 'win32' ? `node "${script.replace(/\\/g, '/')}" statusline` : `"${node}" "${script}" statusline`;
 }
 
+function stopWatcher() {
+  const w = readJson(WATCH, null);
+  if (w?.pid && w.pid !== process.pid && alive(w.pid)) try { process.kill(w.pid); } catch {}
+  try { fs.unlinkSync(WATCH); } catch {}
+}
+
 function uninstall() {
+  stopWatcher();
   const settings = readJson(CLAUDE_SETTINGS, null);
   const cfg = config() || {};
   if (settings) {
@@ -564,20 +862,48 @@ async function pair(code) {
       : `Could not connect: ${message}`);
     process.exit(1);
   }
+  stopWatcher();
   writeJson(CONFIG, { ...(config() || {}), url: project.url, key: project.key, token: res.json.token, deviceId: res.json.device_id, name, revoked: false }, 0o600);
   install();
-  await publishStatus(Date.now());
+  ensureWatcher();
   console.log(`Connected "${name}" to Walls.`);
   console.log('Claude Code now reports to your widgets. Restart any Claude Code session that is already open.');
+}
+
+/** Downloads the public copy, checks it parses, and installs it in place of this one. */
+async function update() {
+  const res = await fetch(PUBLIC_SCRIPT, { signal: AbortSignal.timeout(20_000) });
+  if (!res.ok) throw new Error(`Could not download the newest version (${res.status})`);
+  const text = await res.text();
+  const tmp = path.join(HOME, `walls-agent.${process.pid}.mjs`);
+  fs.mkdirSync(HOME, { recursive: true });
+  fs.writeFileSync(tmp, text);
+  const check = spawnSync(process.execPath, ['--check', tmp], { encoding: 'utf8' });
+  if (check.status !== 0) { fs.rmSync(tmp, { force: true }); throw new Error('The download is not a valid script; nothing changed.'); }
+  const same = fs.existsSync(INSTALLED) && fs.readFileSync(INSTALLED, 'utf8') === text;
+  fs.renameSync(tmp, INSTALLED);
+  // The new version writes its own hooks; the old watcher sees the file change and leaves.
+  const run = spawnSync(process.execPath, [INSTALLED, 'install'], { stdio: 'inherit' });
+  if (run.status !== 0) throw new Error('Installing the new version failed.');
+  console.log(same ? 'Already up to date.' : 'Updated. Open Claude Code sessions pick it up at their next step.');
 }
 
 function status() {
   const cfg = config();
   if (!cfg?.token) { console.log('Not connected. Get a code in Walls, then run this again with: pair'); return; }
   console.log(`Connected as "${cfg.name}"${cfg.revoked ? ' (removed in the app: run pair again)' : ''}.`);
-  const st = readJson(path.join(HOME, 'status.json'), null);
+  const w = readJson(WATCH, null);
+  console.log(w && alive(w.pid) ? `Watcher running (process ${w.pid}).` : 'Watcher not running; the next Claude Code step starts it.');
+  const now = Date.now();
+  const sessions = ranked(allSessions(now).filter((s) => s.state !== 'ended'));
+  if (!sessions.length) console.log('No Claude Code session open.');
+  for (const s of sessions) {
+    const running = s.pid ? (alive(s.pid) ? `process ${s.pid}` : `process ${s.pid} gone`) : 'process unknown';
+    console.log(`  ${s.project || '?'} · ${s.state} · ${s.label} · ${running}${s.attended === false ? ' · nobody at it' : ''}`);
+  }
+  const st = readJson(STATUS, null);
   const us = readJson(USAGE, null);
-  if (st) console.log('Status:', JSON.stringify(st.report));
+  if (st) console.log(`Last report, ${Math.round((now - st.sentAt) / 1000)} s ago:`, JSON.stringify(st.report));
   if (us) console.log('Usage:', JSON.stringify(us.report));
 }
 
@@ -587,16 +913,19 @@ async function main() {
     switch (command) {
       case 'pair': await pair(arg); break;
       case 'unpair': uninstall(); fs.rmSync(CONFIG, { force: true }); console.log('Removed. Remove this PC in Walls too if it is still listed.'); break;
-      case 'install': install(); console.log('Hooks and status line installed.'); break;
+      case 'install': install(); stopWatcher(); if (config()?.token) ensureWatcher(); console.log('Hooks and status line installed.'); break;
+      case 'update': await update(); break;
       case 'status': status(); break;
       case 'hook': await hook(); break;
       case 'statusline': await statusline(); break;
-      case 'send-usage': await sendUsage(); break;
-      default: console.log('Usage: walls-agent pair [CODE] | status | unpair | install');
+      case 'watch': await watch(); break;
+      // Version 1 status lines start this; the watcher does its work now.
+      case 'send-usage': if (config()?.token) ensureWatcher(); break;
+      default: console.log('Usage: walls-agent pair [CODE] | status | update | unpair | install');
     }
   } catch (e) {
-    // Hooks and the status line must never get in Claude Code's way.
-    if (['hook', 'statusline', 'send-usage'].includes(command)) process.exit(0);
+    // Hooks, the status line and the watcher must never get in Claude Code's way.
+    if (['hook', 'statusline', 'watch', 'send-usage'].includes(command)) process.exit(0);
     console.error(e.message || e);
     process.exit(1);
   }
