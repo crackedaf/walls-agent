@@ -1,10 +1,10 @@
 # walls-agent
 
-`walls-agent` sends what each Claude Code session on your PC is doing, and how much of your Claude plan it has used, to the agent widgets in the Walls Android app (Widgets › Agents & Tools). It follows every session at once: several terminals, several projects, `claude -p` runs and background agents. It is one file with no dependencies and works on Windows, macOS and Linux. It needs Node.js 18 or newer.
+`walls-agent` sends what each Claude Code session on your PC is doing, and how much of your Claude plan it has used, to the agent widgets in the Walls Android app (Widgets › AI & Agents). It follows every session at once: several terminals, several projects, `claude -p` runs and background agents. It is one file with no dependencies and works on Windows, macOS and Linux. It needs Node.js 18 or newer.
 
 ## Connect a PC (once)
 
-1. **Phone:** sign in to Walls, then open Widgets › Agents & Tools › Connect a PC › **Get a pairing code**. The code works for ten minutes.
+1. **Phone:** sign in to Walls, then open Widgets › AI & Agents › Connect a PC › **Get a pairing code**. The code works for ten minutes.
 2. **PC:** run the line for your system. It downloads the script and starts pairing.
 
    Windows (PowerShell):
