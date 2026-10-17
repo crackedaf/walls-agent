@@ -148,17 +148,23 @@ export function claudeProcess(env = process.env) {
 const base = (p) => (typeof p === 'string' && p ? path.basename(p) : '');
 const clip = (s, n = 40) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 const word = /^[A-Za-z][\w.:+-]{0,23}$/;
+const leadingKeywords = new Set(['if', 'elif', 'then', 'else', 'while', 'until', 'do', 'time', '!', '{', '(']);
+const shellSyntax = new Set(['for', 'select', 'case', 'in', 'done', 'fi', 'esac', '}', ')', 'function', '[', '[[', 'test']);
 
 /** "git push", "gradlew assembleDebug": the program and its subcommand, never the rest of the command. */
 export function commandName(command) {
   const parts = String(command || '').split(/&&|\|\||;|\||\n/).map((s) => s.trim()).filter(Boolean);
   for (const part of parts) {
-    const words = part.split(/\s+/).filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    let words = part.split(/\s+/).filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    // A loop's or a test's keyword comes before the program it runs ("do adb …", "then git push"); a loop's own
+    // line ("for k in 1 2") and a test ("[ -f x ]") run nothing worth naming. Without this a loop read "Running for k".
+    while (words.length && leadingKeywords.has(words[0])) words = words.slice(1);
     if (!words.length) continue;
-    const program = base(words[0].replace(/^["']|["']$/g, ''));
-    if (['cd', 'export', 'source', 'set', '.', 'pushd', 'popd', 'echo', 'sleep', 'true'].includes(program)) continue;
+    const program = base(words[0].replace(/^["'(]+|["')]+$/g, ''));
+    if (['cd', 'export', 'source', 'set', '.', 'pushd', 'popd', 'echo', 'sleep', 'true', 'false'].includes(program)) continue;
+    if (shellSyntax.has(program)) continue;
     if (!word.test(program)) return 'a command';
-    const sub = words.slice(1).find((w) => !w.startsWith('-'));
+    const sub = words.slice(1).map((w) => w.replace(/["')]+$/, '')).find((w) => !w.startsWith('-'));
     return sub && word.test(sub) && !sub.includes('/') ? `${program} ${sub}` : program;
   }
   return 'a command';
