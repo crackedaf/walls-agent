@@ -67,6 +67,10 @@ const NO_PID_MS = 30 * 60_000;             // a quiet session noted by version 1
 const HEADLESS_IDLE_MS = 60_000;           // a run nobody is at that hasn't started its turn yet
 const AGENT_QUIET_MS = 30 * 60_000;        // a subagent with no step for this long has finished
 const SESSION_KEEP_MS = 3 * 24 * 3600_000;
+const SHORT_RUN_MS = 8_000;                // a hook or status line run ends by now, whatever it is waiting on
+const LOCK_WAIT_MS = 6_000;                // and gives up waiting for a lock a little before that
+const TMP_KEEP_MS = 60_000;                // a temporary file this old was left by a run that was stopped
+const TMP_SWEEP_MS = 5 * 60_000;
 const LOG_SIZE = 6;
 const REPORT_SESSIONS = 6;
 const REPORT_MAX_BYTES = 7_000;            // the server takes up to 8,000
@@ -85,7 +89,29 @@ function writeJson(file, value, mode) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2), mode ? { mode } : undefined);
-  fs.renameSync(tmp, file);
+  // Windows refuses to replace a file another process is reading for a moment; try again, and never leave the copy.
+  for (let i = 0; ; i++) {
+    try { fs.renameSync(tmp, file); return; } catch (e) {
+      if (i < 8 && ['EPERM', 'EBUSY', 'EACCES'].includes(e.code)) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15); continue; }
+      try { fs.unlinkSync(tmp); } catch {}
+      throw e;
+    }
+  }
+}
+
+/** Removes temporary files left by runs that were stopped between writing and renaming. */
+export function sweepTmp(dirs = [HOME, SESSIONS], now = Date.now()) {
+  let removed = 0;
+  for (const dir of dirs) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const name of names) {
+      if (!name.endsWith('.tmp')) continue;
+      const file = path.join(dir, name);
+      try { if (now - fs.statSync(file).mtimeMs > TMP_KEEP_MS) { fs.unlinkSync(file); removed++; } } catch {}
+    }
+  }
+  return removed;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -94,12 +120,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function locked(name, fn) {
   const dir = path.join(HOME, `${name}.lock`);
   fs.mkdirSync(HOME, { recursive: true });
-  for (let i = 0; ; i++) {
+  const until = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
     try { fs.mkdirSync(dir); break; } catch (e) {
       if (e.code !== 'EEXIST') throw e;
       // A lock older than ten seconds belongs to a process that died.
       try { if (Date.now() - fs.statSync(dir).mtimeMs > 10_000) fs.rmdirSync(dir); } catch {}
-      if (i > 600) throw new Error(`Timed out waiting for ${name}`);
+      if (Date.now() > until) throw new Error(`Timed out waiting for ${name}`);
       await sleep(25);
     }
   }
@@ -648,7 +675,7 @@ async function watch() {
     tokens.set(s.transcript, e);
     return e.total;
   };
-  let prevSweep = 0, lastBeat = 0, lastSent = 0, lastKey = null, failures = 0, nextTry = 0;
+  let prevSweep = 0, prevTmpSweep = 0, lastBeat = 0, lastSent = 0, lastKey = null, failures = 0, nextTry = 0;
   let lastUsageSeq = readJson(SEND, {}).usageSeq ?? null, lastUsageAt = 0, lastOpen = Date.now(), finalSent = false;
 
   for (;;) {
@@ -671,6 +698,8 @@ async function watch() {
       }
       prevSweep = now;
     }
+
+    if (now - prevTmpSweep >= TMP_SWEEP_MS) { sweepTmp(); prevTmpSweep = now; }
 
     const status = statusReport(sessions, now, tokensOf);
     const key = reportKey(status);
@@ -779,7 +808,7 @@ async function statusline() {
   if (usage.seven_day) bits.push(`week ${usage.seven_day.pct}%`);
   if (usage.context_pct != null) bits.push(`context ${usage.context_pct}%`);
   const note = !cfg?.token ? 'not connected' : cfg.revoked ? 'removed in the app · run pair again' : '';
-  process.stdout.write(`walls · ${[...bits, note].filter(Boolean).join(' · ')}\n`);
+  await new Promise((r) => process.stdout.write(`walls · ${[...bits, note].filter(Boolean).join(' · ')}\n`, r));
 }
 
 // Setup
@@ -913,8 +942,14 @@ function status() {
   if (us) console.log('Usage:', JSON.stringify(us.report));
 }
 
+// Claude Code starts these at every step of every session, so each must end at once, even if stdin stays open, a lock
+// stays taken or the chained status line hangs; otherwise they pile up while many sessions work.
+const SHORT_RUNS = ['hook', 'statusline', 'send-usage'];
+
 async function main() {
   const [command, arg] = process.argv.slice(2);
+  const short = SHORT_RUNS.includes(command);
+  if (short) setTimeout(() => process.exit(0), SHORT_RUN_MS).unref();
   try {
     switch (command) {
       case 'pair': await pair(arg); break;
@@ -929,9 +964,10 @@ async function main() {
       case 'send-usage': if (config()?.token) ensureWatcher(); break;
       default: console.log('Usage: walls-agent pair [CODE] | status | update | unpair | install');
     }
+    if (short) process.exit(0);
   } catch (e) {
     // Hooks, the status line and the watcher must never get in Claude Code's way.
-    if (['hook', 'statusline', 'watch', 'send-usage'].includes(command)) process.exit(0);
+    if (short || command === 'watch') process.exit(0);
     console.error(e.message || e);
     process.exit(1);
   }
